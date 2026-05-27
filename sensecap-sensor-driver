@@ -1,0 +1,806 @@
+/*
+ * This is free and unencumbered software released into the public domain.
+ *
+ * Anyone is free to copy, modify, publish, use, compile, sell, or
+ * distribute this software, either in source code form or as a compiled
+ * binary, for any purpose, commercial or non-commercial, and by any means.
+ *
+ * In jurisdictions that recognize copyright laws, the author or authors
+ * of this software dedicate any and all copyright interest in the software
+ * to the public domain. We make this dedication for the benefit of the
+ * public at large and to the detriment of our heirs and successors. We
+ * intend this dedication to be an overt act of relinquishment in perpetuity
+ * of all present and future rights to this software under copyright law.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * For more information, please refer to <https://unlicense.org>
+ */
+
+/**
+ * SenseCAP Indicator Motion Driver
+ *
+ * Controls object background colors on an openHASP device (SenseCAP Indicator)
+ * via MQTT. Each sensor slot (motion or contact) maps to one openHASP object.
+ *
+ * openHASP MQTT topic format:
+ *   hasp/<nodeName>/command/p<page>b<objectId>.bg_color
+ * Payload:
+ *   #RRGGBB
+ *
+ * Sensor semantics (both handled identically at the driver level):
+ *   motion  active / contact open / water wet   → colorActive   (default red)
+ *   motion inactive / contact closed / water dry / smoke clear → per-type inactive color (after fade)
+ *
+ * Author: jlslate (slate)
+ * Version: 2.6.0  — fix label escape chain to pass icon sequences correctly
+ */
+
+import groovy.transform.Field
+
+metadata {
+    definition(
+        name: "SenseCAP Indicator Motion",
+        namespace: "community",
+        author: "jlslate (slate)",
+        description: "openHASP MQTT driver — motion sensor color display on SenseCAP Indicator"
+    ) {
+        capability "Initialize"
+        capability "Actuator"
+
+        command "setMotionActive",   [[name: "sensorIndex", type: "NUMBER", description: "Sensor slot 1–16 — turns tile red"]]
+        command "setMotionInactive", [[name: "sensorIndex", type: "NUMBER", description: "Sensor slot 1–16 — fades tile to green"]]
+        command "setAllInactive"
+        command "reconnectMqtt"
+        command "pushLayout"
+        command "updateLabels",      [[name: "labels",      type: "JSON_OBJECT", description: "Map of sensor index to label text"]]
+        command "updateSlotTypes",   [[name: "slotTypes",   type: "JSON_OBJECT", description: "Map of sensor index to type: motion or contact"]]
+
+        attribute "mqttStatus",      "string"
+        attribute "gridLayout",      "string"
+        attribute "displayRebooted", "string"  // fires on SenseCAP reboot — app subscribes to trigger syncAllSensors
+
+        // Per-slot status and type attributes for all 16 slots
+        attribute "sensor1Status",   "string"
+        attribute "sensor2Status",   "string"
+        attribute "sensor3Status",   "string"
+        attribute "sensor4Status",   "string"
+        attribute "sensor5Status",   "string"
+        attribute "sensor6Status",   "string"
+        attribute "sensor7Status",   "string"
+        attribute "sensor8Status",   "string"
+        attribute "sensor9Status",   "string"
+        attribute "sensor10Status",  "string"
+        attribute "sensor11Status",  "string"
+        attribute "sensor12Status",  "string"
+        attribute "sensor13Status",  "string"
+        attribute "sensor14Status",  "string"
+        attribute "sensor15Status",  "string"
+        attribute "sensor16Status",  "string"
+
+        attribute "sensor1Type",     "string"
+        attribute "sensor2Type",     "string"
+        attribute "sensor3Type",     "string"
+        attribute "sensor4Type",     "string"
+        attribute "sensor5Type",     "string"
+        attribute "sensor6Type",     "string"
+        attribute "sensor7Type",     "string"
+        attribute "sensor8Type",     "string"
+        attribute "sensor9Type",     "string"
+        attribute "sensor10Type",    "string"
+        attribute "sensor11Type",    "string"
+        attribute "sensor12Type",    "string"
+        attribute "sensor13Type",    "string"
+        attribute "sensor14Type",    "string"
+        attribute "sensor15Type",    "string"
+        attribute "sensor16Type",    "string"
+    }
+
+    preferences {
+        input name: "mqttBroker",
+            type: "text",
+            title: "MQTT Broker (Host:Port)",
+            description: "tcp://127.0.0.1:1883 for Hubitat built-in broker",
+            required: true,
+            defaultValue: "tcp://127.0.0.1:1883"
+
+        input name: "mqttClientId",
+            type: "text",
+            title: "MQTT Client ID (unique on broker)",
+            required: true,
+            defaultValue: "hubitat-sensecap-driver"
+
+        input name: "mqttUsername",
+            type: "text",
+            title: "MQTT Username",
+            required: false
+
+        input name: "mqttPassword",
+            type: "password",
+            title: "MQTT Password",
+            required: false
+
+        input name: "haspNode",
+            type: "text",
+            title: "openHASP Node Name",
+            description: "The 'Node name' from openHASP Settings → MQTT (e.g. plate)",
+            required: true,
+            defaultValue: "plate"
+
+        input name: "gridLayout",
+            type: "enum",
+            title: "Display Grid Layout",
+            options: [
+                "2x2": "2×2 (4 sensors)",
+                "3x3": "3×3 (9 sensors)",
+                "4x4": "4×4 (16 sensors)"
+            ],
+            defaultValue: "2x2",
+            required: true
+
+        input name: "colorActive",
+            type: "text",
+            title: "Active color (motion detected)",
+            defaultValue: "#FF0000",
+            description: "Hex color e.g. #FF0000 = red"
+
+        input name: "colorInactive",
+            type: "text",
+            title: "Inactive color — motion sensor (no motion)",
+            defaultValue: "#008000",
+            description: "Hex color e.g. #008000 = green"
+
+        input name: "colorContactInactive",
+            type: "text",
+            title: "Inactive color — contact sensor (closed)",
+            defaultValue: "#00FFFF",
+            description: "Hex color e.g. #00FFFF = cyan"
+
+        input name: "colorWaterInactive",
+            type: "text",
+            title: "Inactive color — water sensor (dry)",
+            defaultValue: "#0000FF",
+            description: "Hex color e.g. #0000FF = blue"
+
+        input name: "colorSmokeInactive",
+            type: "text",
+            title: "Inactive color — smoke sensor (clear)",
+            defaultValue: "#FFFF00",
+            description: "Hex color e.g. #FFFF00 = yellow"
+
+        input name: "fadeDuration",
+            type: "number",
+            title: "Fade duration (seconds, default 30)",
+            defaultValue: 30,
+            required: true
+
+        input name: "backlightOnMotion",
+            type: "bool",
+            title: "Turn backlight ON when any sensor is active",
+            defaultValue: true
+
+        input name: "backlightOffDelay",
+            type: "number",
+            title: "Turn backlight OFF (seconds after all sensors clear, 0 = never)",
+            defaultValue: 0
+
+        input name: "motionBacklightTimeout",
+            type: "number",
+            title: "Turn backlight OFF if motion persists longer than (minutes, 0 = never)",
+            defaultValue: 1
+
+        input name: "extendedMotionBacklightOn",
+            type: "number",
+            title: "Turn backlight back ON if motion still active after backlight-off for (minutes, 0 = never)",
+            defaultValue: 10
+
+        input name: "touchBacklightTimeout",
+            type: "number",
+            title: "Turn backlight OFF (seconds after screen tap when all sensors are green, 0 = never)",
+            defaultValue: 30
+
+        input name: "logLevel",
+            type: "enum",
+            title: "Logging Level",
+            options: [
+                "0": "None",
+                "1": "Info only",
+                "2": "Info + Debug"
+            ],
+            defaultValue: "1",
+            required: true
+    }
+}
+
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+
+def installed() {
+    infoLog "[SenseCAP] Driver installed"
+    initialize()
+}
+
+def updated() {
+    infoLog "[SenseCAP] Preferences updated — reconnecting"
+    initialize()
+}
+
+def initialize() {
+    state.clear()
+    sendEvent(name: "mqttStatus", value: "Initializing")
+    sendEvent(name: "gridLayout",  value: settings.gridLayout ?: "2x2")
+    connectMqtt()
+    runIn(4, pushLayout)       // push pages.jsonl first, then setAllInactive follows
+    runIn(10, setAllInactive)  // give the display time to rebuild its object tree
+    unschedule(sendHeartbeat)
+    runEvery5Minutes(sendHeartbeat)
+}
+
+def uninstalled() {
+    disconnectMqtt()
+}
+
+// ── MQTT ─────────────────────────────────────────────────────────────────────
+
+def connectMqtt() {
+    try {
+        String broker   = settings.mqttBroker   ?: "tcp://127.0.0.1:1883"
+        String clientId = settings.mqttClientId ?: "hubitat-sensecap-${device.id}"
+
+        if (settings.mqttUsername) {
+            interfaces.mqtt.connect(broker, clientId, settings.mqttUsername, settings.mqttPassword)
+        } else {
+            interfaces.mqtt.connect(broker, clientId, null, null)
+        }
+
+        infoLog "[SenseCAP] MQTT connected → ${broker}"
+        sendEvent(name: "mqttStatus", value: "Connected")
+
+        String node = settings.haspNode ?: "plate"
+        interfaces.mqtt.subscribe("hasp/${node}/state/statusupdate")
+        interfaces.mqtt.subscribe("hasp/${node}/state/idle")
+        interfaces.mqtt.subscribe("hasp/${node}/idle")
+        interfaces.mqtt.subscribe("hasp/${node}/state/backlight")
+        interfaces.mqtt.subscribe("hasp/${node}/backlight")
+        debugLog "Subscribed to status, idle, and backlight topics"
+
+    } catch (Exception e) {
+        infoLog "[SenseCAP] ERROR — MQTT connect failed: ${e.message}"
+        sendEvent(name: "mqttStatus", value: "Error: ${e.message}")
+        runIn(30, connectMqtt)
+    }
+}
+
+def disconnectMqtt() {
+    try { interfaces.mqtt.disconnect() } catch (Exception e) { /* ignore */ }
+    sendEvent(name: "mqttStatus", value: "Disconnected")
+}
+
+def reconnectMqtt() {
+    disconnectMqtt()
+    pauseExecution(1000)
+    connectMqtt()
+}
+
+def mqttClientStatus(String status) {
+    infoLog "[SenseCAP] MQTT status: ${status}"
+    sendEvent(name: "mqttStatus", value: status)
+    if (status.startsWith("Error") || status.contains("lost")) {
+        runIn(30, connectMqtt)
+    }
+}
+
+def parse(String description) {
+    def msg = interfaces.mqtt.parseMessage(description)
+    debugLog "Received: topic=${msg.topic} payload=${msg.payload}"
+
+    if (msg.topic.endsWith("/LWT")) {
+        // LWT "online" is published every time the SenseCAP connects to the broker,
+        // which happens on every reboot — far more reliable than parsing statusupdate.
+        if (msg.payload?.trim() == "online") {
+            infoLog "[SenseCAP] LWT online — display rebooted, pushing layout and resyncing"
+            runIn(2, pushLayout)
+            runIn(5, resyncStates)
+            runIn(7, resyncLabels)
+            runIn(9, fireDisplayRebooted)
+        } else {
+            debugLog "LWT: ${msg.payload}"
+        }
+
+    } else if (msg.topic.contains("statusupdate")) {
+        if (!msg.payload?.trim()) { debugLog "Ignoring empty statusupdate echo"; return }
+        try {
+            def json = new groovy.json.JsonSlurper().parseText(msg.payload)
+            if (json.uptime == null) { debugLog "Ignoring statusupdate without uptime"; return }
+            int uptime = (json.uptime) as int
+            if (uptime < 30) {
+                infoLog "[SenseCAP] Display rebooted (uptime ${uptime}s) — pushing layout and resyncing"
+                runIn(2, pushLayout)
+                runIn(5, resyncStates)
+                runIn(7, resyncLabels)
+                runIn(9, fireDisplayRebooted)
+            } else {
+                infoLog "[SenseCAP] Display woke from idle (uptime ${uptime}s) — resyncing"
+                runIn(2, resyncStates)
+                startBacklightTimer()
+            }
+        } catch (Exception e) {
+            infoLog "[SenseCAP] WARN — Could not parse statusupdate: ${e.message}"
+        }
+
+    } else if (msg.topic.contains("state/idle") || msg.topic.endsWith("/idle")) {
+        String idleVal = msg.payload?.trim()
+        if (idleVal == "short" || idleVal == "long") {
+            debugLog "Screen went idle (${idleVal})"
+            state.screenIdle = true
+        } else if (idleVal == "off") {
+            long msSinceHeartbeat = now() - (state.lastHeartbeatMs ?: 0L)
+            if (msSinceHeartbeat < 3000) {
+                debugLog "Ignoring idle off echo from heartbeat"
+            } else {
+                state.screenIdle = false
+                infoLog "[SenseCAP] Screen woke from touch"
+                startBacklightTimer()
+            }
+        }
+
+    } else if (msg.topic.contains("state/backlight") || msg.topic.endsWith("/backlight")) {
+        try {
+            def json = new groovy.json.JsonSlurper().parseText(msg.payload)
+            if (json.state == "off") {
+                state.screenIdle = true
+                debugLog "Backlight off"
+            } else if (json.state == "on") {
+                if (state.screenIdle) {
+                    state.screenIdle = false
+                    debugLog "Backlight on after idle — starting timer"
+                    startBacklightTimer()
+                } else {
+                    debugLog "Backlight on"
+                }
+            }
+        } catch (Exception e) {
+            if (msg.payload?.trim() == "off") state.screenIdle = true
+        }
+    }
+}
+
+private void startBacklightTimer() {
+    if (!settings.backlightOnMotion) return
+    unschedule(backlightOff)
+    unschedule(motionTimeoutBacklightOff)
+
+    boolean anyActive = (1..maxSensors()).any { idx -> state["sensor${idx}"] == "active" }
+    if (anyActive) {
+        int mins = (settings.motionBacklightTimeout ?: 1) as int
+        if (mins > 0) runIn(mins * 60, motionTimeoutBacklightOff)
+    } else {
+        int delay = (settings.touchBacklightTimeout ?: 30) as int
+        if (delay > 0) runIn(delay, backlightOff)
+    }
+}
+
+// ── Commands ─────────────────────────────────────────────────────────────────
+
+def setMotionActive(sensorIndex) {
+    int idx = (sensorIndex as int)
+    if (idx < 1 || idx > maxSensors()) { infoLog "[SenseCAP] WARN — sensorIndex must be 1–${maxSensors()}"; return }
+
+    String sType = state["slotType${idx}"] ?: "motion"
+    state["sensor${idx}"] = "active"
+    sendEvent(name: "sensor${idx}Status", value: sType == "contact" ? "open" : sType == "water" ? "wet" : sType == "smoke" ? "detected" : "active")
+
+    unschedule("fadeStep${idx}")
+    state.remove("fadeStep${idx}")
+    publishColor(idx, settings.colorActive ?: "#FF0000")
+
+    if (settings.backlightOnMotion) {
+        unschedule(backlightOff)
+        unschedule(motionTimeoutBacklightOff)
+        unschedule(extendedMotionBacklightOn)
+        unschedule(backlightOnAfterFade)
+        state.screenIdle = false
+        publishBacklight(true)
+        int mins = (settings.motionBacklightTimeout ?: 1) as int
+        if (mins > 0) {
+            debugLog "Motion active — backlight off in ${mins} min if still active"
+            runIn(mins * 60, motionTimeoutBacklightOff)
+        }
+    }
+}
+
+def setMotionInactive(sensorIndex) {
+    int idx = (sensorIndex as int)
+    if (idx < 1 || idx > maxSensors()) { infoLog "[SenseCAP] WARN — sensorIndex must be 1–${maxSensors()}"; return }
+
+    String sType = state["slotType${idx}"] ?: "motion"
+    boolean wasActive = (state["sensor${idx}"] == "active")
+    state["sensor${idx}"] = "inactive"
+    sendEvent(name: "sensor${idx}Status", value: sType == "contact" ? "closed" : sType == "water" ? "dry" : sType == "smoke" ? "clear" : "inactive")
+
+    if (wasActive) {
+        unschedule("fadeStep${idx}")
+        state["fadeStep${idx}"] = 0
+        scheduleFadeStep(idx)
+
+        if (settings.backlightOnMotion) {
+            unschedule(motionTimeoutBacklightOff)
+            boolean anyStillActive = (1..maxSensors()).any { i -> state["sensor${i}"] == "active" }
+            if (anyStillActive) {
+                int mins = (settings.motionBacklightTimeout ?: 1) as int
+                if (mins > 0) runIn(mins * 60, motionTimeoutBacklightOff)
+            } else {
+                unschedule(extendedMotionBacklightOn)
+                int fadeTime = (FADE_STEPS + 1) * fadeInterval() + 2
+                runIn(fadeTime, backlightOnAfterFade)
+            }
+        }
+    } else {
+        publishColor(idx, inactiveColorFor(idx))
+        if (settings.backlightOnMotion) {
+            unschedule(backlightOff)
+            if (allInactive()) {
+                int delay = (settings.backlightOffDelay ?: 0) as int
+                if (delay > 0) runIn(delay, backlightOff)
+            }
+        }
+    }
+}
+
+// ── Fade ─────────────────────────────────────────────────────────────────────
+
+@Field static final int FADE_STEPS = 6
+
+private int fadeInterval() {
+    int secs = (settings.fadeDuration ?: 30) as int
+    return Math.max(1, Math.round(secs / FADE_STEPS) as int)
+}
+
+private int maxSensors() {
+    switch (settings.gridLayout) {
+        case "4x4": return 16
+        case "3x3": return 9
+        default:    return 4
+    }
+}
+
+private void scheduleFadeStep(int idx) {
+    switch (idx) {
+        case 1:  runIn(fadeInterval(), fadeStep1);  break
+        case 2:  runIn(fadeInterval(), fadeStep2);  break
+        case 3:  runIn(fadeInterval(), fadeStep3);  break
+        case 4:  runIn(fadeInterval(), fadeStep4);  break
+        case 5:  runIn(fadeInterval(), fadeStep5);  break
+        case 6:  runIn(fadeInterval(), fadeStep6);  break
+        case 7:  runIn(fadeInterval(), fadeStep7);  break
+        case 8:  runIn(fadeInterval(), fadeStep8);  break
+        case 9:  runIn(fadeInterval(), fadeStep9);  break
+        case 10: runIn(fadeInterval(), fadeStep10); break
+        case 11: runIn(fadeInterval(), fadeStep11); break
+        case 12: runIn(fadeInterval(), fadeStep12); break
+        case 13: runIn(fadeInterval(), fadeStep13); break
+        case 14: runIn(fadeInterval(), fadeStep14); break
+        case 15: runIn(fadeInterval(), fadeStep15); break
+        case 16: runIn(fadeInterval(), fadeStep16); break
+    }
+}
+
+def fadeStep1()  { doFadeStep(1)  }
+def fadeStep2()  { doFadeStep(2)  }
+def fadeStep3()  { doFadeStep(3)  }
+def fadeStep4()  { doFadeStep(4)  }
+def fadeStep5()  { doFadeStep(5)  }
+def fadeStep6()  { doFadeStep(6)  }
+def fadeStep7()  { doFadeStep(7)  }
+def fadeStep8()  { doFadeStep(8)  }
+def fadeStep9()  { doFadeStep(9)  }
+def fadeStep10() { doFadeStep(10) }
+def fadeStep11() { doFadeStep(11) }
+def fadeStep12() { doFadeStep(12) }
+def fadeStep13() { doFadeStep(13) }
+def fadeStep14() { doFadeStep(14) }
+def fadeStep15() { doFadeStep(15) }
+def fadeStep16() { doFadeStep(16) }
+
+private void doFadeStep(int idx) {
+    if (state["sensor${idx}"] == "active") {
+        debugLog "Fade aborted — sensor ${idx} is active again"
+        return
+    }
+
+    int step     = (state["fadeStep${idx}"] ?: 0) as int
+    int maxSteps = FADE_STEPS
+
+    int red  = Math.round(255.0 * (1.0 - (step / maxSteps as double))) as int
+    red      = Math.max(0, Math.min(255, red))
+    String hex = sprintf("#%02X0000", red)
+    debugLog "Fade sensor ${idx} step ${step}/${maxSteps} → ${hex}"
+    publishColor(idx, hex)
+
+    if (step < maxSteps) {
+        state["fadeStep${idx}"] = step + 1
+        scheduleFadeStep(idx)
+    } else {
+        state.remove("fadeStep${idx}")
+        debugLog "Fade sensor ${idx} complete — snapping to inactive color"
+        publishColor(idx, inactiveColorFor(idx))
+
+        if (settings.backlightOnMotion && allInactive() && !state.screenIdle) {
+            unschedule(backlightOff)
+            unschedule(backlightOnAfterFade)
+            int delay = (settings.backlightOffDelay ?: 0) as int
+            if (delay > 0) {
+                debugLog "All sensors green — backlight off in ${delay}s"
+                runIn(delay, backlightOff)
+            }
+        }
+    }
+}
+
+// ── Layout push ───────────────────────────────────────────────────────────────
+
+// Each entry is one line of pages.jsonl for the matching grid layout.
+// openHASP processes these via the command/jsonl topic, one line at a time.
+// Display: SenseCAP Indicator D1, 480×480 px.
+
+@Field static final List<String> LAYOUT_2x2 = [
+    '{"page":1,"id":1,"obj":"btn","x":2,"y":2,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 1","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":2,"obj":"btn","x":242,"y":2,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 2","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":3,"obj":"btn","x":2,"y":242,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 3","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":4,"obj":"btn","x":242,"y":242,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 4","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}'
+]
+
+@Field static final List<String> LAYOUT_3x3 = [
+    '{"page":1,"id":1,"obj":"btn","x":2,"y":2,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 1","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":2,"obj":"btn","x":161,"y":2,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 2","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":3,"obj":"btn","x":320,"y":2,"w":158,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 3","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":4,"obj":"btn","x":2,"y":161,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 4","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":5,"obj":"btn","x":161,"y":161,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 5","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":6,"obj":"btn","x":320,"y":161,"w":158,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 6","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":7,"obj":"btn","x":2,"y":320,"w":157,"h":158,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 7","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":8,"obj":"btn","x":161,"y":320,"w":157,"h":158,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 8","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":9,"obj":"btn","x":320,"y":320,"w":158,"h":158,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 9","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}'
+]
+
+@Field static final List<String> LAYOUT_4x4 = [
+    '{"page":1,"id":1,"obj":"btn","x":2,"y":2,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 1","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":2,"obj":"btn","x":121,"y":2,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 2","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":3,"obj":"btn","x":240,"y":2,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 3","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":4,"obj":"btn","x":359,"y":2,"w":119,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 4","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":5,"obj":"btn","x":2,"y":121,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 5","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":6,"obj":"btn","x":121,"y":121,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 6","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":7,"obj":"btn","x":240,"y":121,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 7","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":8,"obj":"btn","x":359,"y":121,"w":119,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 8","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":9,"obj":"btn","x":2,"y":240,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 9","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":10,"obj":"btn","x":121,"y":240,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 10","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":11,"obj":"btn","x":240,"y":240,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 11","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":12,"obj":"btn","x":359,"y":240,"w":119,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 12","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":13,"obj":"btn","x":2,"y":359,"w":117,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 13","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":14,"obj":"btn","x":121,"y":359,"w":117,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 14","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":15,"obj":"btn","x":240,"y":359,"w":117,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 15","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
+    '{"page":1,"id":16,"obj":"btn","x":359,"y":359,"w":119,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 16","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}'
+]
+
+/**
+ * pushLayout — publishes the pages.jsonl layout for the selected grid to the
+ * SenseCAP display over MQTT using openHASP's command/jsonl topic.
+ * Called automatically on initialize(); can also be triggered manually from
+ * the device Commands panel after changing the grid layout preference.
+ */
+def pushLayout() {
+    String node = settings.haspNode ?: "plate"
+    String topic = "hasp/${node}/command/jsonl"
+
+    List<String> lines
+    switch (settings.gridLayout) {
+        case "4x4": lines = LAYOUT_4x4; break
+        case "3x3": lines = LAYOUT_3x3; break
+        default:    lines = LAYOUT_2x2; break
+    }
+
+    infoLog "[SenseCAP] Pushing ${settings.gridLayout} layout (${lines.size()} objects) → ${topic}"
+    try {
+        lines.each { line ->
+            interfaces.mqtt.publish(topic, line, 1, false)
+            pauseExecution(80)  // give openHASP time to parse each object
+        }
+        infoLog "[SenseCAP] Layout push complete"
+    } catch (Exception e) {
+        infoLog "[SenseCAP] ERROR — Layout push failed: ${e.message}"
+    }
+}
+
+// ── Labels & Resync ───────────────────────────────────────────────────────────
+
+def fireDisplayRebooted() {
+    infoLog "[SenseCAP] Firing displayRebooted event — app will sync sensor states"
+    sendEvent(name: "displayRebooted", value: new Date().toString(), isStateChange: true)
+}
+
+def resyncLabels() {
+    if (state.labels) updateLabels(state.labels)
+}
+
+def updateLabels(Map labels) {
+    String node = settings.haspNode ?: "plate"
+    state.labels = labels
+    debugLog "Updating labels: ${labels}"
+    labels.each { idx, text ->
+        String topic = "hasp/${node}/command/p1b${idx}.jsonl"
+        // Escape only what JSON requires: quotes and real newlines.
+        // Do NOT escape backslashes globally — icon sequences (backslash + uXXXX) and \n
+        // must reach the JSON payload as-is so openHASP/LVGL can decode them.
+        String escaped = text.toString()
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+        String payload = "{\"text\":\"${escaped}\"}"
+        try {
+            interfaces.mqtt.publish(topic, payload, 1, false)
+            pauseExecution(100)
+        } catch (Exception e) {
+            infoLog "[SenseCAP] ERROR — label publish failed for slot ${idx}: ${e.message}"
+        }
+    }
+}
+
+/**
+ * updateSlotTypes — called by the app on initialize() so the driver knows
+ * whether each slot is a "motion", "contact", or "water" sensor. Storing the
+ * type before resyncing colors ensures contact slots show cyan and water slots
+ * show blue from the moment the app saves — even after a hub reboot that clears
+ * state via initialize().
+ * Map format: [ 1: "motion", 2: "contact", 3: "water", ... ]
+ */
+def updateSlotTypes(Map slotTypes) {
+    debugLog "Updating slot types: ${slotTypes}"
+    slotTypes.each { idx, type ->
+        state["slotType${idx}"] = type
+        sendEvent(name: "sensor${idx}Type", value: type)
+    }
+    // Resync colors now that types are known — corrects any slots that were
+    // painted with the wrong inactive color before types arrived.
+    resyncStates()
+}
+
+def setAllInactive() {
+    (1..maxSensors()).each { idx ->
+        setMotionInactive(idx)
+        pauseExecution(150)
+    }
+}
+
+def resyncStates() {
+    (1..maxSensors()).each { idx ->
+        String currentState = state["sensor${idx}"] ?: "inactive"
+        if (currentState == "active") {
+            publishColor(idx, settings.colorActive ?: "#FF0000")
+        } else if (state["fadeStep${idx}"] != null) {
+            int step = (state["fadeStep${idx}"] ?: 0) as int
+            int red  = Math.round(255.0 * (1.0 - (step / FADE_STEPS as double))) as int
+            publishColor(idx, sprintf("#%02X0000", Math.max(0, Math.min(255, red))))
+        } else {
+            publishColor(idx, inactiveColorFor(idx))
+        }
+        pauseExecution(150)
+    }
+}
+
+// ── Heartbeat ─────────────────────────────────────────────────────────────────
+
+def sendHeartbeat() {
+    String node  = settings.haspNode ?: "plate"
+    String topic = "hasp/${node}/command/page"
+    try {
+        interfaces.mqtt.publish(topic, "", 1, false)
+        state.lastHeartbeatMs = now()
+        debugLog "Heartbeat sent"
+    } catch (Exception e) {
+        infoLog "[SenseCAP] WARN — Heartbeat failed: ${e.message}"
+        runIn(5, connectMqtt)
+    }
+}
+
+// ── Backlight helpers ────────────────────────────────────────────────────────
+
+def backlightOff() {
+    if (allInactive()) {
+        debugLog "All sensors green — turning backlight off"
+        publishBacklight(false)
+    } else {
+        debugLog "backlightOff skipped — motion still active"
+    }
+}
+
+def backlightOnAfterFade() {
+    boolean anyActive = (1..maxSensors()).any { idx -> state["sensor${idx}"] == "active" }
+    if (anyActive) { debugLog "backlightOnAfterFade skipped — motion became active again"; return }
+    infoLog "[SenseCAP] All sensors green after fade — turning backlight on"
+    state.screenIdle = false
+    publishBacklight(true)
+    int delay = (settings.touchBacklightTimeout ?: 30) as int
+    if (delay > 0) runIn(delay, backlightOff)
+}
+
+def motionTimeoutBacklightOff() {
+    boolean anyTrulyActive = (1..maxSensors()).any { idx -> state["sensor${idx}"] == "active" }
+    if (anyTrulyActive) {
+        infoLog "[SenseCAP] Motion persisted past timeout — turning backlight off"
+        publishBacklight(false)
+        unschedule(extendedMotionBacklightOn)
+        int mins = (settings.extendedMotionBacklightOn ?: 10) as int
+        if (mins > 0) {
+            debugLog "Scheduling backlight back on in ${mins} min if motion still active"
+            runIn(mins * 60, extendedMotionBacklightOn)
+        }
+    } else {
+        debugLog "motionTimeoutBacklightOff skipped — no sensors truly active (may be fading)"
+    }
+}
+
+def extendedMotionBacklightOn() {
+    boolean anyTrulyActive = (1..maxSensors()).any { idx -> state["sensor${idx}"] == "active" }
+    if (anyTrulyActive) {
+        infoLog "[SenseCAP] Motion still active after extended period — turning backlight back on"
+        publishBacklight(true)
+        int mins = (settings.motionBacklightTimeout ?: 1) as int
+        if (mins > 0) runIn(mins * 60, motionTimeoutBacklightOff)
+    } else {
+        debugLog "extendedMotionBacklightOn skipped — no sensors truly active"
+    }
+}
+
+private void publishBacklight(boolean on) {
+    String node    = settings.haspNode ?: "plate"
+    String topic   = "hasp/${node}/command/backlight"
+    String payload = on ? "on" : "off"
+    debugLog "Backlight → ${payload}"
+    try {
+        interfaces.mqtt.publish(topic, payload, 1, false)
+    } catch (Exception e) {
+        infoLog "[SenseCAP] ERROR — Backlight publish failed: ${e.message}"
+    }
+}
+
+private boolean allInactive() {
+    return (1..maxSensors()).every { idx ->
+        (state["sensor${idx}"] ?: "inactive") == "inactive" &&
+        state["fadeStep${idx}"] == null
+    }
+}
+
+private String inactiveColorFor(int idx) {
+    switch (state["slotType${idx}"]) {
+        case "water":   return settings.colorWaterInactive   ?: "#0000FF"
+        case "contact": return settings.colorContactInactive ?: "#00FFFF"
+        case "smoke":   return settings.colorSmokeInactive   ?: "#FFFF00"
+        default:        return settings.colorInactive        ?: "#008000"
+    }
+}
+
+private void publishColor(int sensorIdx, String colorHex) {
+    int    page  = 1
+    String node  = settings.haspNode ?: "plate"
+    String color = colorHex.startsWith("#") ? colorHex : "#${colorHex}"
+    String topic = "hasp/${node}/command/p${page}b${sensorIdx}.bg_color"
+    debugLog "Publish → ${topic} : ${color}"
+    try {
+        interfaces.mqtt.publish(topic, color, 1, false)
+    } catch (Exception e) {
+        infoLog "[SenseCAP] ERROR — Publish failed: ${e.message}"
+        sendEvent(name: "mqttStatus", value: "Publish Error")
+        runIn(5, connectMqtt)
+    }
+}
+
+private void infoLog(String msg) {
+    if ((settings.logLevel ?: "1") != "0") log.info msg
+}
+
+private void debugLog(String msg) {
+    if ((settings.logLevel ?: "1") == "2") log.debug msg
+}
