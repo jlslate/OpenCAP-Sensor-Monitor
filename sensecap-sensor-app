@@ -24,21 +24,17 @@
  */
 
 /**
- * SenseCAP Indicator Motion App
+ * SenseCAP Sensor Monitor App
  *
  * Links up to 16 Hubitat motion, contact, water, or smoke sensors to a SenseCAP Indicator display.
  *
- * Motion sensor:   active    → RED  |  inactive  → fades to GREEN
- * Contact sensor:  open      → RED  |  closed    → fades to CYAN
- * Water sensor:    wet       → RED  |  dry       → fades to BLUE
- * Smoke sensor:    detected  → RED  |  clear     → fades to YELLOW
  *
  * Author: jlslate (slate)
  * Version: 3.0.0  — state-driven icons, single grid setting in app, deferred layout push, optimised MQTT batching
  */
 
 definition(
-    name: "SenseCAP Indicator Motion",
+    name: "SenseCAP Sensor Monitor",
     namespace: "community",
     author: "jlslate (slate)",
     description: "Shows motion, contact, water, and smoke sensor states on a SenseCAP Indicator display via MQTT",
@@ -171,12 +167,12 @@ def mainPage() {
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 def installed() {
-    infoLog "[SensorDisplay] Installed"
+    infoLog "[SensorMonitor] Installed"
     initialize()
 }
 
 def updated() {
-    infoLog "[SensorDisplay] Updated"
+    infoLog "[SensorMonitor] Updated"
     unsubscribe()
     initialize()
 }
@@ -213,7 +209,7 @@ def initialize() {
         settings.indicatorDevice.setGridLayout(newGrid)
 
         if (state.lastPushedGrid != newGrid) {
-            infoLog "[SensorDisplay] Grid changed ${state.lastPushedGrid} → ${newGrid} — pushing new layout"
+            infoLog "[SensorMonitor] Grid changed ${state.lastPushedGrid} → ${newGrid} — pushing new layout"
             settings.indicatorDevice.pushLayout()
             state.lastPushedGrid = newGrid
             // pushLayout takes ~2s — schedule labels/types to arrive after it completes
@@ -229,7 +225,7 @@ def initialize() {
         subscribe(settings.indicatorDevice, "displayRebooted", displayRebootedHandler)
     }
 
-    infoLog "[SensorDisplay] Initialized — ${subscribedCount()} sensor(s) subscribed"
+    infoLog "[SensorMonitor] Initialized — ${subscribedCount()} sensor(s) subscribed"
 }
 
 // ── Deferred label/type push ─────────────────────────────────────────────────
@@ -270,7 +266,7 @@ def motionHandler16(evt) { handleMotion(evt, 16) }
 
 private void handleMotion(evt, int idx) {
     debugLog "Motion slot ${idx} (${evt.displayName}): ${evt.value}"
-    if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
+    if (!settings.indicatorDevice) { infoLog "[SensorMonitor] WARN — No Indicator device configured"; return }
     if (evt.value == "active") {
         settings.indicatorDevice.setMotionActive(idx)
     } else {
@@ -299,7 +295,7 @@ def contactHandler16(evt) { handleContact(evt, 16) }
 
 private void handleContact(evt, int idx) {
     debugLog "Contact slot ${idx} (${evt.displayName}): ${evt.value}"
-    if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
+    if (!settings.indicatorDevice) { infoLog "[SensorMonitor] WARN — No Indicator device configured"; return }
     if (evt.value == "open") {
         settings.indicatorDevice.setMotionActive(idx)
     } else {
@@ -328,7 +324,7 @@ def waterHandler16(evt) { handleWater(evt, 16) }
 
 private void handleWater(evt, int idx) {
     debugLog "Water slot ${idx} (${evt.displayName}): ${evt.value}"
-    if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
+    if (!settings.indicatorDevice) { infoLog "[SensorMonitor] WARN — No Indicator device configured"; return }
     if (evt.value == "wet") {
         settings.indicatorDevice.setMotionActive(idx)
     } else {
@@ -357,7 +353,7 @@ def smokeHandler16(evt) { handleSmoke(evt, 16) }
 
 private void handleSmoke(evt, int idx) {
     debugLog "Smoke slot ${idx} (${evt.displayName}): ${evt.value}"
-    if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
+    if (!settings.indicatorDevice) { infoLog "[SensorMonitor] WARN — No Indicator device configured"; return }
     if (evt.value == "detected") {
         settings.indicatorDevice.setMotionActive(idx)
     } else {
@@ -368,7 +364,7 @@ private void handleSmoke(evt, int idx) {
 // ── Sync ─────────────────────────────────────────────────────────────────────
 
 def syncAllSensors() {
-    infoLog "[SensorDisplay] Syncing all sensor states → display"
+    infoLog "[SensorMonitor] Syncing all sensor states → display"
 
     (1..maxSlots()).each { idx ->
         def dev  = settings["sensor${idx}"]
@@ -415,7 +411,7 @@ def syncAllSensors() {
 // ── Display Reboot Handler ────────────────────────────────────────────────────
 
 def displayRebootedHandler(evt) {
-    infoLog "[SensorDisplay] SenseCAP rebooted — pushing grid, types, labels and syncing sensor states"
+    infoLog "[SensorMonitor] SenseCAP rebooted — pushing grid, types, labels and syncing sensor states"
     if (settings.indicatorDevice) {
         settings.indicatorDevice.setGridLayout(settings.gridLayout ?: "2x2")
     }
