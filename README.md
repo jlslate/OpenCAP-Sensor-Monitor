@@ -1,6 +1,6 @@
 # SenseCAP Sensor Monitor for Hubitat
 
-### This project allows you to display either a 2x2, 3x3, or 4x4 grid of sensors from a Hubitat hub onto a SenseCAP Indicator D1 configured with OpenHASP firmware.
+### This project allows you to display anywhere from a 1x1 tile (1 sensor) up to and including a 7x7 (49 sensors) grid of sensors from a Hubitat hub onto a SenseCAP Indicator D1 configured with OpenHASP firmware.
 
 ## Requirements
 
@@ -78,8 +78,8 @@
   - For each sensor type choose the **Inactive color**
   - Modify any of the other fields as required and select **Save**
   - Select **Save** and then select **Commands**
-  - Choose the **Set Grid Layout** that corresponds to the layout you chose
-  - Select **Reconnect Mqtt**
+  - ~~Choose the **Set Grid Layout** that corresponds to the layout you chose~~ Not needed
+  - ~~Select **Reconnect Mqtt**~~ Probably not needed
   - You should see _Connected_ on the **Mqtt Status** and on the serial port connection, messages like _MQTT RCV: p1b1.bg_color = #008000_
 
 ## Install and Configure the app
@@ -89,6 +89,8 @@
   - Choose the **Grid Layout** you want
   - For each slot, choose the **Sensor Type**, the device you wnat to use, and the **Label**
   - Select **Done**
+
+### Be patient, it takes a while to populate
 
 # You should now see motion on the SenseCAP
 
