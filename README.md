@@ -1,5 +1,4 @@
-# SCapIM
-## SenseCAP Sensor for Hubitat
+# SenseCAP Sensor Monitor for Hubitat
 
 ### This project allows you to display either a 2x2 or 3x3 or 4x4 grid of sensors from a Hubitat hub onto a SenseCAP Indicator D1 configured with OpenHASP firmware.
 
